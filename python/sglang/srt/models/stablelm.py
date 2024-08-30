@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/stablelm.py#L1
 """Inference-only StableLM-2 (https://huggingface.co/stabilityai/stablelm-2-1_6b)
@@ -9,7 +24,6 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -23,9 +37,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.model_runner import InputMetadata
+from sglang.srt.layers.sampler import Sampler
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
 class StablelmMLP(nn.Module):
@@ -234,7 +250,9 @@ class StableLmForCausalLM(nn.Module):
         self.model = StableLMEpochModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
+        self.sampler = Sampler()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -243,9 +261,11 @@ class StableLmForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
+        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
+        return sample_output, logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

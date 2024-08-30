@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """Conversation templates."""
 
 # Adapted from
@@ -6,7 +21,7 @@ import dataclasses
 from enum import IntEnum, auto
 from typing import Dict, List, Optional, Tuple, Union
 
-from sglang.srt.openai_protocol import ChatCompletionRequest
+from sglang.srt.openai_api.protocol import ChatCompletionRequest
 
 
 class SeparatorStyle(IntEnum):
@@ -19,6 +34,7 @@ class SeparatorStyle(IntEnum):
     NO_COLON_TWO = auto()
     ADD_NEW_LINE_SINGLE = auto()
     LLAMA2 = auto()
+    LLAMA3 = auto()
     CHATGLM = auto()
     CHATML = auto()
     CHATINTERN = auto()
@@ -121,6 +137,20 @@ class Conversation:
                     ret += "\n\n"
                 else:
                     ret += role + ":"
+            return ret
+        elif self.sep_style == SeparatorStyle.LLAMA3:
+            ret = "<|begin_of_text|>"
+            if self.system_message:
+                ret += system_prompt
+            else:
+                ret += ""
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
+                    ret += f"{message.strip()}<|eot_id|>"
+                else:
+                    ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
+            # print(ret)
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA2:
             seps = [self.sep, self.sep2]
@@ -364,12 +394,23 @@ def generate_chat_conv(
                 conv.append_message(conv.roles[0], message.content)
             else:
                 real_content = ""
+                # calculate number of image_url
+                num_image_url = 0
+                for content in message.content:
+                    if content.type == "image_url":
+                        num_image_url += 1
+                if num_image_url > 1:
+                    image_token = "<image>"
+                else:
+                    image_token = "<image>\n"
                 for content in message.content:
                     if content.type == "text":
+                        if num_image_url > 16:
+                            real_content += "\n"  # for video
                         real_content += content.text
                     elif content.type == "image_url":
                         # NOTE: Only works for llava
-                        real_content += "<image>\n"
+                        real_content += image_token
                         conv.append_image(content.image_url.url)
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
@@ -412,6 +453,18 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="chatml-llava",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are a helpful assistant.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep_style=SeparatorStyle.CHATML,
+        sep="<|im_end|>",
+        stop_str=["<|endoftext|>", "<|im_end|>"],
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="vicuna_v1.1",
         system_message="A chat between a curious user and an artificial intelligence assistant. "
         "The assistant gives helpful, detailed, and polite answers to the user's questions.",
@@ -419,5 +472,27 @@ register_conv_template(
         sep_style=SeparatorStyle.ADD_COLON_TWO,
         sep=" ",
         sep2="</s>",
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="llava_llama_3",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_template="<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA3,
+        sep="",
+        stop_str=["<|end_of_text|>", "<|eot_id|>"],
+    )
+)
+# Reference: https://github.com/InternLM/lmdeploy/blob/387bf54b4f124e72aab30ae9755f562e435d3d01/lmdeploy/model.py#L425-L442
+register_conv_template(
+    Conversation(
+        name="internlm2-chat",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="\n",
+        stop_str=["<|im_end|>", "<|action_end|>"],
     )
 )

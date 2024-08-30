@@ -4,8 +4,9 @@ import os
 import re
 from typing import Callable, List, Optional, Union
 
-from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
+from sglang.lang.backend.base_backend import BaseBackend
+from sglang.lang.choices import ChoicesSamplingMethod, token_length_normalized
 from sglang.lang.ir import (
     SglExpr,
     SglExprList,
@@ -61,9 +62,11 @@ def gen(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
+    stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
+    min_p: Optional[float] = None,
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
@@ -71,14 +74,21 @@ def gen(
     logprob_start_len: Optional[int] = None,
     top_logprobs_num: Optional[int] = None,
     return_text_in_logprobs: Optional[bool] = None,
-    dtype: Optional[type] = None,
+    dtype: Optional[Union[type, str]] = None,
     choices: Optional[List[str]] = None,
+    choices_method: Optional[ChoicesSamplingMethod] = None,
     regex: Optional[str] = None,
+    json_schema: Optional[str] = None,
 ):
-    """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
+    """Call the model to generate. See the meaning of the arguments in docs/en/sampling_params.md"""
 
     if choices:
-        return SglSelect(name, choices, 0.0 if temperature is None else temperature)
+        return SglSelect(
+            name,
+            choices,
+            0.0 if temperature is None else temperature,
+            token_length_normalized if choices_method is None else choices_method,
+        )
 
     # check regex is valid
     if regex is not None:
@@ -91,9 +101,11 @@ def gen(
         name,
         max_tokens,
         stop,
+        stop_token_ids,
         temperature,
         top_p,
         top_k,
+        min_p,
         frequency_penalty,
         presence_penalty,
         ignore_eos,
@@ -103,6 +115,7 @@ def gen(
         return_text_in_logprobs,
         dtype,
         regex,
+        json_schema,
     )
 
 
@@ -110,9 +123,11 @@ def gen_int(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
+    stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
+    min_p: Optional[float] = None,
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
@@ -125,9 +140,11 @@ def gen_int(
         name,
         max_tokens,
         stop,
+        stop_token_ids,
         temperature,
         top_p,
         top_k,
+        min_p,
         frequency_penalty,
         presence_penalty,
         ignore_eos,
@@ -144,9 +161,11 @@ def gen_string(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
+    stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
+    min_p: Optional[float] = None,
     frequency_penalty: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     ignore_eos: Optional[bool] = None,
@@ -159,9 +178,11 @@ def gen_string(
         name,
         max_tokens,
         stop,
+        stop_token_ids,
         temperature,
         top_p,
         top_k,
+        min_p,
         frequency_penalty,
         presence_penalty,
         ignore_eos,
@@ -186,9 +207,10 @@ def select(
     name: Optional[str] = None,
     choices: Optional[List[str]] = None,
     temperature: float = 0.0,
+    choices_method: ChoicesSamplingMethod = token_length_normalized,
 ):
     assert choices is not None
-    return SglSelect(name, choices, temperature)
+    return SglSelect(name, choices, temperature, choices_method)
 
 
 def _role_common(name: str, expr: Optional[SglExpr] = None):
@@ -208,6 +230,14 @@ def user(expr: Optional[SglExpr] = None):
 
 def assistant(expr: Optional[SglExpr] = None):
     return _role_common("assistant", expr)
+
+
+def system_begin():
+    return SglRoleBegin("system")
+
+
+def system_end():
+    return SglRoleEnd("system")
 
 
 def user_begin():

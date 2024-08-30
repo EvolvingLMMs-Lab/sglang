@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
 from typing import Iterable, Optional, Set, Tuple, Union
@@ -7,12 +22,6 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig, LoRAConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-
-# FIXME: temporary solution, remove after next vllm release
-from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.activation import GeluAndMul
-
-# from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -23,57 +32,19 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 # from vllm.model_executor.layers.rotary_embedding import GemmaRotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 
+from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.model_runner import InputMetadata
+from sglang.srt.layers.sampler import Sampler
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
-class GemmaRMSNorm(CustomOp):
-    """RMS normalization for Gemma.
-
-    Two differences from the above RMSNorm:
-        1. x * (1 + w) instead of x * w.
-        2. (x * w).to(orig_dtype) instead of x.to(orig_dtype) * w.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward_native(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """PyTorch-native implementation equivalent to forward()."""
-        orig_dtype = x.dtype
-        if residual is not None:
-            x = x + residual
-            residual = x
-
-        x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-        # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        x = x * (1.0 + self.weight.float())
-        x = x.to(orig_dtype)
-        return x if residual is None else (x, residual)
-
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # from vLLM: TODO(woosuk): Implement an optimized kernel for GemmaRMSNorm.
-        return self.forward_native(x, residual)
+# Aligned with HF's implementation, using sliding window inclusive with the last token
+# SGLang assumes exclusive
+def get_attention_sliding_window_size(config):
+    return config.sliding_window - 1
 
 
 # FIXME: temporary solution, remove after next vllm release
@@ -115,7 +86,7 @@ class Gemma2MLP(nn.Module):
                 "function. Please set `hidden_act` and `hidden_activation` to "
                 "`gelu_pytorch_tanh`."
             )
-        self.act_fn = GeluAndMul(approximate="tanh")
+        self.act_fn = GeluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
@@ -186,17 +157,18 @@ class Gemma2Attention(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        # from vLLM: FIXME(woosuk): While Gemma 2 uses sliding window attention for every
-        # odd layer, vLLM currently ignores it and uses global attention for
-        # all layers.
-        use_sliding_window = layer_idx % 2 == 1 and config.sliding_window is not None
-        del use_sliding_window  # Unused.
+        use_sliding_window = layer_idx % 2 == 0 and hasattr(config, "sliding_window")
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_idx,
+            sliding_window_size=(
+                get_attention_sliding_window_size(config)
+                if use_sliding_window
+                else None
+            ),
             logit_cap=self.config.attn_logit_softcapping,
         )
 
@@ -375,6 +347,7 @@ class Gemma2ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.model = Gemma2Model(config, cache_config, quant_config)
         self.logits_processor = LogitsProcessor(config)
+        self.sampler = Sampler()
 
     @torch.no_grad()
     def forward(
@@ -385,9 +358,14 @@ class Gemma2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
         )
+        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
+        return sample_output, logits_output
+
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

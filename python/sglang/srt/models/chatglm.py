@@ -1,16 +1,29 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 # coding=utf-8
 # Adapted from
 # https://github.com/THUDM/ChatGLM2-6B
 """Inference-only ChatGLM model compatible with THUDM weights."""
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.nn import LayerNorm
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -18,19 +31,19 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.sequence import SamplerOutput
 from vllm.transformers_utils.configs import ChatGLMConfig
 
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.model_runner import InputMetadata
+from sglang.srt.layers.sampler import Sampler
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 LoraConfig = None
 
@@ -360,6 +373,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.sampler = Sampler()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -367,17 +381,11 @@ class ChatGLMForCausalLM(nn.Module):
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
         hidden_states = self.transformer(input_ids, positions, input_metadata)
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
+        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
+        return sample_output, logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))

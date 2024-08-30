@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """Inference-only Yi-VL model."""
 
 from typing import Iterable, Optional, Tuple
@@ -9,10 +24,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.models.llava import (
-    LlavaLlamaForCausalLM,
-    monkey_path_clip_vision_embed_forward,
-)
+from sglang.srt.models.llava import LlavaLlamaForCausalLM
 
 
 class YiVLForCausalLM(LlavaLlamaForCausalLM):
@@ -35,7 +47,7 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
             self.config._name_or_path,
             torch_dtype=torch.float16,
             subfolder=self.vision_tower_subfolder,
-        ).cuda()
+        ).to("cuda")
 
         self.vision_tower.eval()
 
@@ -78,8 +90,6 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
 
         # load language model
         self.language_model.load_weights(weights)
-
-        monkey_path_clip_vision_embed_forward()
 
 
 class YiVLMultiModalProjector(nn.Module):

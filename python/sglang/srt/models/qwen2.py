@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 # Adapted from llama2.py
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
@@ -7,8 +22,6 @@ import torch
 from torch import nn
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -22,9 +35,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.model_runner import InputMetadata
+from sglang.srt.layers.sampler import Sampler
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 Qwen2Config = None
 
@@ -260,18 +277,27 @@ class Qwen2ForCausalLM(nn.Module):
         self.model = Qwen2Model(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
+        self.sampler = Sampler()
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
+        get_embedding: bool = False,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
-        )
+        if not get_embedding:
+            logits_output = self.logits_processor(
+                input_ids, hidden_states, self.lm_head.weight, input_metadata
+            )
+            sample_output = self.sampler(logits_output, input_metadata.sampling_info)
+            return sample_output, logits_output
+        else:
+            return self.pooler(hidden_states, input_metadata)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -290,14 +316,15 @@ class Qwen2ForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
+            if name.startswith("model.vision_tower") and name not in params_dict:
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -307,11 +334,14 @@ class Qwen2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                if (
+                    self.config.tie_word_embeddings
+                    and name == "model.embed_tokens.weight"
+                ):
+                    weight_loader(params_dict["lm_head.weight"], loaded_weight)
 
 
 EntryClass = Qwen2ForCausalLM
